@@ -1,0 +1,4 @@
+# Pinned to versions with prebuilt wheels for Python 3.11-3.14.
+aiohttp==3.14.3
+httpx==0.28.1
+python-dotenv==1.2.2

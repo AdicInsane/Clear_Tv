@@ -36,7 +36,7 @@ from aiohttp import web
 
 import accounts
 import config
-import relay
+import recorder
 from channels import Channel, store
 
 logger = logging.getLogger("leaf.admin")
@@ -302,25 +302,52 @@ async def handle_lineup(request: web.Request) -> web.Response:
         "channels": [_channel_json(c) for c in store.all()],
         "stats": store.stats(),
         "capacity": accounts.capacity(),
-        "cache": relay.cache_stats(),
+        "recordings": len(recorder.recordings),
     })
 
 
-async def _verify(slug: str, account_id: str, stream_id: str) -> tuple[bool, str, dict]:
+async def _verify_stream(account_id: str, stream_id: str) -> tuple[bool, str]:
     """
-    Try to pull the channel's playlist once. Returns (ok, error, stream_info).
+    Quick reachability check before committing a channel to the lineup.
 
-    Done at add/start time so a dead channel is reported immediately in the panel
-    rather than appearing in the catalog and failing in the player later.
+    Checks the SAME .ts URL the recorder will hand to ffmpeg, not the .m3u8 —
+    verifying a different URL than the one that gets recorded proves nothing.
+
+    Two things matter here:
+      * redirects must be followed. Xtream panels routinely 302 from the catalog
+        URL to the edge that actually serves the stream, so treating a 302 as a
+        failure rejects perfectly good channels.
+      * the response must be streamed and closed after the first chunk. A live
+        .ts URL never ends, so a plain GET would download until the timeout.
     """
+    import httpx as _hx
+
     acc = accounts.get_account(account_id)
     if acc is None:
-        return False, "account disappeared", {}
+        return False, "account disappeared"
+
+    url = recorder.to_ts_url(accounts.stream_url(acc, stream_id))
+
     try:
-        _, info = await relay.playlist_for(slug, accounts.stream_url(acc, stream_id))
-        return True, "", info
+        async with _hx.AsyncClient(
+            verify=config.UPSTREAM_VERIFY_TLS,
+            timeout=10.0,
+            follow_redirects=True,
+        ) as cl:
+            async with cl.stream(
+                "GET", url, headers={"User-Agent": config.UPSTREAM_USER_AGENT}
+            ) as resp:
+                if resp.status_code not in (200, 206):
+                    return False, f"provider returned HTTP {resp.status_code}"
+                # Read one chunk only. A 200 with an empty body is a dead channel
+                # that the status code alone would pass.
+                async for chunk in resp.aiter_bytes():
+                    if chunk:
+                        return True, ""
+                    break
+                return False, "provider sent no data"
     except Exception as exc:
-        return False, str(exc), {}
+        return False, str(exc)
 
 
 @require_auth
@@ -367,14 +394,15 @@ async def handle_add_channel(request: web.Request) -> web.Response:
 
     stream_info: dict = {}
     if verify:
-        ok, err, stream_info = await _verify(slug, account_id, stream_id)
+        ok, err = await _verify_stream(account_id, stream_id)
         if not ok:
-            # Hand the account straight back — nothing is going to stream on it.
             await accounts.release(account_id)
-            relay.drop_playlist(slug)
             return _json({"error": f"stream check failed: {err}"}, status=502)
 
-    channel = store.add(Channel(
+    acc_full = accounts.get_account(account_id)
+    up_url = accounts.stream_url(acc_full, stream_id) if acc_full else ""
+
+    channel = await store.add(Channel(
         slug=slug,
         display_name=display_name,
         stream_id=stream_id,
@@ -384,6 +412,9 @@ async def handle_add_channel(request: web.Request) -> web.Response:
         enabled=True,
         stream_info=stream_info,
     ))
+
+    # Start the recorder immediately.
+    recorder.start_recording(slug, up_url, display_name)
 
     logger.info("channel live: %s → account %s (stream_id=%s)", slug, account_id, stream_id)
     return _json({"ok": True, "channel": _channel_json(channel)})
@@ -408,12 +439,9 @@ async def handle_stop_channel(request: web.Request) -> web.Response:
 
     account_id = ch.account_id
 
-    store.set_enabled(slug, False)
-    relay.drop_playlist(slug)
+    await store.set_enabled(slug, False)
+    recorder.stop_recording(slug)
 
-    # Release by both id and slug: the id covers the normal case, the slug sweep
-    # catches an account whose claim drifted (e.g. edited on disk while running),
-    # so an account can never end up locked with nothing playing on it.
     if account_id:
         await accounts.release(account_id)
     await accounts.release_slug(slug)
@@ -444,15 +472,18 @@ async def handle_start_channel(request: web.Request) -> web.Response:
             status=409,
         )
 
-    ok, err, stream_info = await _verify(slug, account_id, ch.stream_id)
+    ok, err = await _verify_stream(account_id, ch.stream_id)
     if not ok:
         await accounts.release(account_id)
-        relay.drop_playlist(slug)
-        store.update(slug, last_error=err)
+        await store.update(slug, last_error=err)
         return _json({"error": f"stream check failed: {err}"}, status=502)
 
-    store.set_enabled(slug, True)
-    store.update(slug, account_id=account_id, stream_info=stream_info, last_error="")
+    acc_full = accounts.get_account(account_id)
+    up_url = accounts.stream_url(acc_full, ch.stream_id) if acc_full else ""
+
+    await store.set_enabled(slug, True)
+    await store.update(slug, account_id=account_id, last_error="")
+    recorder.start_recording(slug, up_url, ch.display_name)
 
     logger.info("channel restarted: %s → account %s", slug, account_id)
     return _json({"ok": True, "channel": _channel_json(store.get(slug))})
@@ -468,8 +499,8 @@ async def handle_remove_channel(request: web.Request) -> web.Response:
         return _json({"error": "not found"}, status=404)
 
     account_id = ch.account_id
-    store.remove(slug)
-    relay.drop_playlist(slug)
+    await store.remove(slug)
+    recorder.stop_recording(slug)
 
     if account_id:
         await accounts.release(account_id)
@@ -509,7 +540,7 @@ async def handle_patch_channel(request: web.Request) -> web.Response:
     if not fields:
         return _json({"error": "nothing to update"}, status=400)
 
-    ch = store.update(slug, **fields)
+    ch = await store.update(slug, **fields)
     return _json({"ok": True, "channel": _channel_json(ch)})
 
 
@@ -541,11 +572,16 @@ async def restore() -> None:
             account_id, _acc = await accounts.claim(ch.slug)
 
         if not account_id:
-            store.update(ch.slug, last_error="no account available at startup")
+            await store.update(ch.slug, last_error="no account available at startup")
             logger.warning("channel %s: could not re-claim an account", ch.slug)
             continue
 
-        store.update(ch.slug, account_id=account_id, last_error="")
+        await store.update(ch.slug, account_id=account_id, last_error="")
+        # Re-start the recorder for this channel.
+        acc_full = accounts.get_account(account_id)
+        up_url = accounts.stream_url(acc_full, ch.stream_id) if acc_full else ""
+        if up_url:
+            recorder.start_recording(ch.slug, up_url, ch.display_name)
         restored += 1
 
     logger.info("restored %d/%d live channel(s)", restored, len(enabled))
